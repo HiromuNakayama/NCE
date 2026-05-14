@@ -492,63 +492,76 @@ fit_weighted_nce_hmm_unknown_A <- function(
 }
 
 ############################################################
-# 8. Estimation
+# 8. Estimation with multiple initial values
 ############################################################
 
-fit <- fit_weighted_nce_hmm_unknown_A(
-  x = x,
-  K = K,
-  R = 50,
-  noise_ratio = 5,
-  damping = 0.7
-)
+# Number of runs with different initializations
+num_runs <- 5
+
+fit_list <- vector("list", num_runs)
+
+for (run in 1:num_runs) {
+  cat("Run", run, "of", num_runs, "\n")
+  
+  fit_list[[run]] <- fit_weighted_nce_hmm_unknown_A(
+    x = x,
+    K = K,
+    R = 50,
+    noise_ratio = 5,
+    damping = 0.7
+  )
+}
+
+# Use the first fit as the main result for comparison
+fit <- fit_list[[1]]
 
 ############################################################
-# 9. Results
+# 9. Results from first run
 ############################################################
 
 cat("True mu:\n")
 print(mu_true)
 
-cat("Estimated mu:\n")
+cat("Estimated mu (Run 1):\n")
 print(fit$mu)
 
 cat("True lambda:\n")
 print(lambda_true)
 
-cat("Estimated lambda:\n")
+cat("Estimated lambda (Run 1):\n")
 print(fit$lambda)
 
 cat("True c = -log Z:\n")
 print(c_true)
 
-cat("Estimated c:\n")
+cat("Estimated c (Run 1):\n")
 print(fit$c)
 
 cat("True A:\n")
 print(A_true)
 
-cat("Estimated A:\n")
+cat("Estimated A (Run 1):\n")
 print(fit$A)
 
 cat("True stationary rho:\n")
 print(rho_true)
 
-cat("Estimated stationary rho:\n")
+cat("Estimated stationary rho (Run 1):\n")
 print(fit$rho)
 
 z_hat <- apply(fit$gamma, 1, which.max)
 acc <- mean(z_hat == z_true)
 
-cat("State classification accuracy:\n")
+cat("State classification accuracy (Run 1):\n")
 print(acc)
 
 print(fit$history)
 
 ############################################################
-# 10. Oracle / Weighted NCE / Naive comparison
+# 9.5 Comparison of multiple runs
 ############################################################
 
+# Helper functions for comparison
 best_accuracy_2state <- function(z_hat, z_true) {
   acc1 <- mean(z_hat == z_true)
   acc2 <- mean((3 - z_hat) == z_true)
@@ -558,6 +571,81 @@ best_accuracy_2state <- function(z_hat, z_true) {
 l1_gamma_distance <- function(gamma_hat, gamma_ref) {
   mean(rowSums(abs(gamma_hat - gamma_ref)))
 }
+
+cat("\n\n========== CONVERGENCE ANALYSIS: Multiple Initial Values ==========\n\n")
+
+# Extract estimated parameters from each run
+mu_estimates <- matrix(NA, nrow = num_runs, ncol = K)
+lambda_estimates <- matrix(NA, nrow = num_runs, ncol = K)
+c_estimates <- matrix(NA, nrow = num_runs, ncol = K)
+accuracy_list <- numeric(num_runs)
+
+for (run in 1:num_runs) {
+  mu_estimates[run, ] <- fit_list[[run]]$mu
+  lambda_estimates[run, ] <- fit_list[[run]]$lambda
+  c_estimates[run, ] <- fit_list[[run]]$c
+  
+  z_hat_run <- apply(fit_list[[run]]$gamma, 1, which.max)
+  accuracy_list[run] <- best_accuracy_2state(z_hat_run, z_true)
+}
+
+cat("Estimated mu across runs:\n")
+print(mu_estimates)
+cat("\n")
+
+cat("Estimated lambda across runs:\n")
+print(lambda_estimates)
+cat("\n")
+
+cat("Estimated c across runs:\n")
+print(c_estimates)
+cat("\n")
+
+cat("Classification accuracy across runs:\n")
+print(accuracy_list)
+cat("\n")
+
+# Calculate convergence metrics
+cat("Standard deviations of mu estimates across runs:\n")
+print(apply(mu_estimates, 2, sd))
+cat("\n")
+
+cat("Standard deviations of lambda estimates across runs:\n")
+print(apply(lambda_estimates, 2, sd))
+cat("\n")
+
+cat("Standard deviations of c estimates across runs:\n")
+print(apply(c_estimates, 2, sd))
+cat("\n")
+
+# Check if all runs converge to similar values
+mu_cv <- apply(mu_estimates, 2, function(x) sd(x) / mean(abs(x)))
+lambda_cv <- apply(lambda_estimates, 2, function(x) sd(x) / mean(abs(x)))
+c_cv <- apply(c_estimates, 2, function(x) sd(x) / (mean(abs(x)) + 1e-10))
+
+cat("Coefficient of variation for mu:\n")
+print(mu_cv)
+cat("\n")
+
+cat("Coefficient of variation for lambda:\n")
+print(lambda_cv)
+cat("\n")
+
+cat("Coefficient of variation for c:\n")
+print(c_cv)
+cat("\n")
+
+if (all(mu_cv < 0.1) && all(lambda_cv < 0.1) && all(c_cv < 0.1)) {
+  cat("✓ All runs converged to similar values (CV < 0.1)\n")
+} else {
+  cat("✗ Some parameters show variation across runs (CV ≥ 0.1)\n")
+}
+
+cat("\n========== END OF CONVERGENCE ANALYSIS ==========\n\n")
+
+############################################################
+# 11. Oracle / Weighted NCE / Naive comparison
+############################################################
 
 fit_oracle <- filter_smooth_with_xi(
   x = x,
