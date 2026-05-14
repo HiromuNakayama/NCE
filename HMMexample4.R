@@ -230,6 +230,8 @@ weighted_nce_objective <- function(
 
   nx <- noise_density_fun(x)
   ny <- noise_density_fun(noise_y)
+  nx <- pmax(nx, .Machine$double.xmin)
+  ny <- pmax(ny, .Machine$double.xmin)
 
   log_num_x <- log(Nk) + sx
   log_noise_x <- log(Mk) + log(nx)
@@ -275,6 +277,53 @@ update_one_state_nce <- function(
   fit$par
 }
 
+row_to_logits <- function(p, eps = 1e-10) {
+  p <- pmax(p, eps)
+  p <- p / sum(p)
+  K <- length(p)
+
+  log(p[1:(K - 1)] / p[K])
+}
+
+logits_to_row <- function(v) {
+  z <- c(v, 0)
+  z <- z - max(z)
+  p <- exp(z)
+
+  p / sum(p)
+}
+
+A_to_logits <- function(A) {
+  do.call(
+    rbind,
+    lapply(seq_len(nrow(A)), function(j) row_to_logits(A[j, ]))
+  )
+}
+
+logits_to_A <- function(L) {
+  do.call(
+    rbind,
+    lapply(seq_len(nrow(L)), function(j) logits_to_row(L[j, ]))
+  )
+}
+
+interpolate_A_logit <- function(A_old, A_cand, alpha) {
+  L_old <- A_to_logits(A_old)
+  L_cand <- A_to_logits(A_cand)
+
+  logits_to_A((1 - alpha) * L_old + alpha * L_cand)
+}
+
+interpolate_eta <- function(old, cand, alpha) {
+  list(
+    A = interpolate_A_logit(old$A, cand$A, alpha),
+    mu = (1 - alpha) * old$mu + alpha * cand$mu,
+    log_lambda = (1 - alpha) * old$log_lambda +
+      alpha * cand$log_lambda,
+    c = (1 - alpha) * old$c + alpha * cand$c
+  )
+}
+
 ############################################################
 # 7. Weighted NCE-HMM with unknown A
 #    rho is recalculated as the stationary distribution of A.
@@ -297,7 +346,12 @@ fit_weighted_nce_hmm_unknown_A <- function(
   R = 50,
   noise_ratio = 5,
   damping = 0.7,
-  tol = 1e-6
+  tol = 1e-6,
+  alpha_init = damping,
+  shrink = 0.5,
+  alpha_min = 1e-6,
+  loglik_tol = tol,
+  objective_tol = 1e-10
 ) {
   T_len <- length(x)
 
@@ -350,16 +404,18 @@ fit_weighted_nce_hmm_unknown_A <- function(
   history <- data.frame()
 
   for (r in 1:R) {
-    old_mu <- mu
-    old_log_lambda <- log_lambda
-    old_c <- c
-    old_A <- A
+    old <- list(
+      A = A,
+      mu = mu,
+      log_lambda = log_lambda,
+      c = c
+    )
 
     loglik_before <- observed_loglik_gaussian_hmm(
       x = x,
-      A = A,
-      mu = mu,
-      lambda = exp(log_lambda)
+      A = old$A,
+      mu = old$mu,
+      lambda = exp(old$log_lambda)
     )
 
     rho <- stationary_dist(A)
@@ -389,15 +445,16 @@ fit_weighted_nce_hmm_unknown_A <- function(
 
     A_new <- A_new / rowSums(A_new)
 
-    A <- (1 - damping) * A + damping * A_new
-    A <- A / rowSums(A)
-
     loglik_after_A <- observed_loglik_gaussian_hmm(
       x = x,
-      A = A,
-      mu = old_mu,
-      lambda = exp(old_log_lambda)
+      A = A_new,
+      mu = old$mu,
+      lambda = exp(old$log_lambda)
     )
+
+    mu_cand <- mu
+    log_lambda_cand <- log_lambda
+    c_cand <- c
 
     for (k in 1:K) {
       init_par <- c(mu[k], log_lambda[k], c[k])
@@ -410,14 +467,67 @@ fit_weighted_nce_hmm_unknown_A <- function(
         noise_density_fun = noise_density_fun
       )
 
-      mu[k] <- (1 - damping) * mu[k] + damping * new_par[1]
-      log_lambda[k] <-
-        (1 - damping) * log_lambda[k] + damping * new_par[2]
-      c[k] <- (1 - damping) * c[k] + damping * new_par[3]
+      mu_cand[k] <- new_par[1]
+      log_lambda_cand[k] <- new_par[2]
+      c_cand[k] <- new_par[3]
+    }
+
+    cand <- list(
+      A = A_new,
+      mu = mu_cand,
+      log_lambda = log_lambda_cand,
+      c = c_cand
+    )
+
+    ord <- order(cand$mu)
+    cand$mu <- cand$mu[ord]
+    cand$log_lambda <- cand$log_lambda[ord]
+    cand$c <- cand$c[ord]
+    cand$A <- cand$A[ord, ord]
+
+    alpha <- alpha_init
+    accepted <- FALSE
+    line_search_steps <- 0
+    loglik_after_NCE <- loglik_before
+    eta_new <- old
+
+    while (alpha >= alpha_min) {
+      line_search_steps <- line_search_steps + 1
+      eta_try <- interpolate_eta(old, cand, alpha)
+
+      loglik_try <- observed_loglik_gaussian_hmm(
+        x = x,
+        A = eta_try$A,
+        mu = eta_try$mu,
+        lambda = exp(eta_try$log_lambda)
+      )
+
+      if (is.finite(loglik_try) &&
+          loglik_try >= loglik_before - objective_tol) {
+        accepted <- TRUE
+        eta_new <- eta_try
+        loglik_after_NCE <- loglik_try
+        break
+      }
+
+      alpha <- alpha * shrink
+    }
+
+    if (accepted) {
+      A <- eta_new$A
+      mu <- eta_new$mu
+      log_lambda <- eta_new$log_lambda
+      c <- eta_new$c
+      alpha_accepted <- alpha
+    } else {
+      A <- old$A
+      mu <- old$mu
+      log_lambda <- old$log_lambda
+      c <- old$c
+      alpha_accepted <- 0
     }
 
     ord <- order(mu)
-
     mu <- mu[ord]
     log_lambda <- log_lambda[ord]
     c <- c[ord]
@@ -430,10 +540,12 @@ fit_weighted_nce_hmm_unknown_A <- function(
       lambda = exp(log_lambda)
     )
 
-    diff <- sum(abs(mu - old_mu)) +
-      sum(abs(log_lambda - old_log_lambda)) +
-      sum(abs(c - old_c)) +
-      sum(abs(A - old_A))
+    diff <- sum(abs(mu - old$mu)) +
+      sum(abs(log_lambda - old$log_lambda)) +
+      sum(abs(c - old$c)) +
+      sum(abs(A - old$A))
+
+    delta_loglik_total <- loglik_after_NCE - loglik_before
 
     rho_current <- stationary_dist(A)
 
@@ -459,11 +571,14 @@ fit_weighted_nce_hmm_unknown_A <- function(
         loglik_after_NCE = loglik_after_NCE,
         delta_loglik_A = loglik_after_A - loglik_before,
         delta_loglik_NCE = loglik_after_NCE - loglik_after_A,
-        delta_loglik_total = loglik_after_NCE - loglik_before
+        delta_loglik_total = delta_loglik_total,
+        alpha_accepted = alpha_accepted,
+        line_search_steps = line_search_steps,
+        line_search_accepted = accepted
       )
     )
 
-    if (diff < tol) {
+    if (delta_loglik_total < loglik_tol) {
       break
     }
   }
@@ -492,76 +607,63 @@ fit_weighted_nce_hmm_unknown_A <- function(
 }
 
 ############################################################
-# 8. Estimation with multiple initial values
+# 8. Estimation
 ############################################################
 
-# Number of runs with different initializations
-num_runs <- 5
-
-fit_list <- vector("list", num_runs)
-
-for (run in 1:num_runs) {
-  cat("Run", run, "of", num_runs, "\n")
-  
-  fit_list[[run]] <- fit_weighted_nce_hmm_unknown_A(
-    x = x,
-    K = K,
-    R = 50,
-    noise_ratio = 5,
-    damping = 0.7
-  )
-}
-
-# Use the first fit as the main result for comparison
-fit <- fit_list[[1]]
+fit <- fit_weighted_nce_hmm_unknown_A(
+  x = x,
+  K = K,
+  R = 50,
+  noise_ratio = 5,
+  damping = 0.7
+)
 
 ############################################################
-# 9. Results from first run
+# 9. Results
 ############################################################
 
 cat("True mu:\n")
 print(mu_true)
 
-cat("Estimated mu (Run 1):\n")
+cat("Estimated mu:\n")
 print(fit$mu)
 
 cat("True lambda:\n")
 print(lambda_true)
 
-cat("Estimated lambda (Run 1):\n")
+cat("Estimated lambda:\n")
 print(fit$lambda)
 
 cat("True c = -log Z:\n")
 print(c_true)
 
-cat("Estimated c (Run 1):\n")
+cat("Estimated c:\n")
 print(fit$c)
 
 cat("True A:\n")
 print(A_true)
 
-cat("Estimated A (Run 1):\n")
+cat("Estimated A:\n")
 print(fit$A)
 
 cat("True stationary rho:\n")
 print(rho_true)
 
-cat("Estimated stationary rho (Run 1):\n")
+cat("Estimated stationary rho:\n")
 print(fit$rho)
 
 z_hat <- apply(fit$gamma, 1, which.max)
 acc <- mean(z_hat == z_true)
 
-cat("State classification accuracy (Run 1):\n")
+cat("State classification accuracy:\n")
 print(acc)
 
 print(fit$history)
 
 ############################################################
-# 9.5 Comparison of multiple runs
+# 10. Oracle / Weighted NCE / Naive comparison
 ############################################################
 
-# Helper functions for comparison
 best_accuracy_2state <- function(z_hat, z_true) {
   acc1 <- mean(z_hat == z_true)
   acc2 <- mean((3 - z_hat) == z_true)
@@ -571,81 +673,6 @@ best_accuracy_2state <- function(z_hat, z_true) {
 l1_gamma_distance <- function(gamma_hat, gamma_ref) {
   mean(rowSums(abs(gamma_hat - gamma_ref)))
 }
-
-cat("\n\n========== CONVERGENCE ANALYSIS: Multiple Initial Values ==========\n\n")
-
-# Extract estimated parameters from each run
-mu_estimates <- matrix(NA, nrow = num_runs, ncol = K)
-lambda_estimates <- matrix(NA, nrow = num_runs, ncol = K)
-c_estimates <- matrix(NA, nrow = num_runs, ncol = K)
-accuracy_list <- numeric(num_runs)
-
-for (run in 1:num_runs) {
-  mu_estimates[run, ] <- fit_list[[run]]$mu
-  lambda_estimates[run, ] <- fit_list[[run]]$lambda
-  c_estimates[run, ] <- fit_list[[run]]$c
-  
-  z_hat_run <- apply(fit_list[[run]]$gamma, 1, which.max)
-  accuracy_list[run] <- best_accuracy_2state(z_hat_run, z_true)
-}
-
-cat("Estimated mu across runs:\n")
-print(mu_estimates)
-cat("\n")
-
-cat("Estimated lambda across runs:\n")
-print(lambda_estimates)
-cat("\n")
-
-cat("Estimated c across runs:\n")
-print(c_estimates)
-cat("\n")
-
-cat("Classification accuracy across runs:\n")
-print(accuracy_list)
-cat("\n")
-
-# Calculate convergence metrics
-cat("Standard deviations of mu estimates across runs:\n")
-print(apply(mu_estimates, 2, sd))
-cat("\n")
-
-cat("Standard deviations of lambda estimates across runs:\n")
-print(apply(lambda_estimates, 2, sd))
-cat("\n")
-
-cat("Standard deviations of c estimates across runs:\n")
-print(apply(c_estimates, 2, sd))
-cat("\n")
-
-# Check if all runs converge to similar values
-mu_cv <- apply(mu_estimates, 2, function(x) sd(x) / mean(abs(x)))
-lambda_cv <- apply(lambda_estimates, 2, function(x) sd(x) / mean(abs(x)))
-c_cv <- apply(c_estimates, 2, function(x) sd(x) / (mean(abs(x)) + 1e-10))
-
-cat("Coefficient of variation for mu:\n")
-print(mu_cv)
-cat("\n")
-
-cat("Coefficient of variation for lambda:\n")
-print(lambda_cv)
-cat("\n")
-
-cat("Coefficient of variation for c:\n")
-print(c_cv)
-cat("\n")
-
-if (all(mu_cv < 0.1) && all(lambda_cv < 0.1) && all(c_cv < 0.1)) {
-  cat("✓ All runs converged to similar values (CV < 0.1)\n")
-} else {
-  cat("✗ Some parameters show variation across runs (CV ≥ 0.1)\n")
-}
-
-cat("\n========== END OF CONVERGENCE ANALYSIS ==========\n\n")
-
-############################################################
-# 11. Oracle / Weighted NCE / Naive comparison
-############################################################
 
 fit_oracle <- filter_smooth_with_xi(
   x = x,
@@ -727,9 +754,9 @@ plot(
 
 plot(
   fit$history$iter,
-  fit$history$diff,
+  fit$history$delta_loglik_total,
   type = "b",
   main = "Convergence",
   xlab = "iteration",
-  ylab = "parameter change"
+  ylab = "increase in observed log-likelihood"
 )
